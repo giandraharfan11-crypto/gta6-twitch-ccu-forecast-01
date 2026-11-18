@@ -46,6 +46,7 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
+Z_BY_LEVEL = dict(zip(LEVELS, Z))
 FALLBACK_SIGMA = 0.15  # persistence fallback spread, per sqrt(hour - 1)
 
 BW = 2.0               # kernel bandwidth on log hour-1 size
@@ -107,12 +108,40 @@ def round2(x):
     return int(value) if float(value).is_integer() else value
 
 
-def fallback_quantiles(p1, h):
-    return [p1 * math.exp(z * FALLBACK_SIGMA * math.sqrt(h - 1)) for z in Z]
+def fallback_quantiles(p1, h, taus):
+    return [p1 * math.exp(z * FALLBACK_SIGMA * math.sqrt(h - 1))
+            for z in (normal_quantile(t) for t in taus)]
 
 
-def hour_quantiles(p1, log_p1, pool, h):
-    """The five quantiles for one hour from the comparable pool.
+def normal_quantile(tau):
+    """Standard normal quantile (Acklam's rational approximation)."""
+    if tau in Z_BY_LEVEL:
+        return Z_BY_LEVEL[tau]
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if tau < plow:
+        q = math.sqrt(-2 * math.log(tau))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    if tau > phigh:
+        q = math.sqrt(-2 * math.log(1 - tau))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+                ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    q = tau - 0.5
+    r = q * q
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+
+
+def hour_quantiles(p1, log_p1, pool, h, taus):
+    """The quantiles for one hour from the comparable pool, at levels `taus`.
 
     pool entries: (log hour-1 size, kernel weight, day curve).
     """
@@ -123,7 +152,7 @@ def hour_quantiles(p1, log_p1, pool, h):
         if v1 and vh and v1 > 0 and vh > 0:
             samples.append((log_v1, math.log(vh / v1), weight))
     if len(samples) < MIN_SAMPLES:
-        return fallback_quantiles(p1, h)
+        return fallback_quantiles(p1, h, taus)
 
     sw = sum(w for _, _, w in samples)
     mx = sum(w * x for x, _, w in samples) / sw
@@ -135,7 +164,7 @@ def hour_quantiles(p1, log_p1, pool, h):
     residuals = [(y - (my + beta * (x - mx)), w) for x, y, w in samples]
 
     quantiles = []
-    for tau in LEVELS:
+    for tau in taus:
         if tau == 0.5:
             log_q = mu
         else:
@@ -176,12 +205,17 @@ def forecast_case(case):
             weight *= CONSOLE_BOOST
         pool.append((log_v1, weight, curve))
 
+    taus = case.get("levels")
+    if not (isinstance(taus, list) and taus
+            and all(isinstance(t, (int, float)) and 0 < t < 1 for t in taus)):
+        taus = LEVELS
+
     rows = []
     for row in case.get("forecast") or []:
         h = row["hour"]
-        rows.append({"hour": h, "q": clean(hour_quantiles(p1, log_p1, pool, h))})
+        rows.append({"hour": h, "q": clean(hour_quantiles(p1, log_p1, pool, h, taus))})
     if not rows:  # a case with no forecast rows still gets a full, valid answer
-        rows = [{"hour": h, "q": clean(fallback_quantiles(p1, h))} for h in range(2, 25)]
+        rows = [{"hour": h, "q": clean(fallback_quantiles(p1, h, taus))} for h in range(2, 25)]
     return {"hours": rows}
 
 
